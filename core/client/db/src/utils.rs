@@ -17,9 +17,9 @@
 //! Db-based backend utility structures and functions, used by both
 //! full and light storages.
 
+#[cfg(feature = "kvdb-rocksdb")]
 use std::sync::Arc;
-use std::io;
-use std::convert::TryInto;
+use std::{io, convert::TryInto};
 
 use kvdb::{KeyValueDB, DBTransaction};
 #[cfg(feature = "kvdb-rocksdb")]
@@ -34,11 +34,12 @@ use runtime_primitives::traits::{
 	Block as BlockT, Header as HeaderT, Zero, UniqueSaturatedFrom,
 	UniqueSaturatedInto, CheckedConversion
 };
+#[cfg(feature = "kvdb-rocksdb")]
 use crate::DatabaseSettings;
 
 /// Number of columns in the db. Must be the same for both full && light dbs.
 /// Otherwise RocksDb will fail to open database && check its type.
-pub const NUM_COLUMNS: u32 = 9;
+pub const NUM_COLUMNS: u32 = 10;
 /// Meta column. The set of keys in the column is shared by full && light storages.
 pub const COLUMN_META: Option<u32> = Some(0);
 
@@ -171,7 +172,7 @@ pub fn insert_hash_to_key_mapping<N: TryInto<u32>, H: AsRef<[u8]> + Clone>(
 /// block lookup key is the DB-key header, block and justification are stored under.
 /// looks up lookup key by hash from DB as necessary.
 pub fn block_id_to_lookup_key<Block>(
-	db: &KeyValueDB,
+	db: &dyn KeyValueDB,
 	key_lookup_col: Option<u32>,
 	id: BlockId<Block>
 ) -> Result<Option<Vec<u8>>, client::error::Error> where
@@ -191,13 +192,16 @@ pub fn block_id_to_lookup_key<Block>(
 
 /// Maps database error to client error
 pub fn db_err(err: io::Error) -> client::error::Error {
-	use std::error::Error;
-	client::error::Error::Backend(err.description().into())
+	client::error::Error::Backend(format!("{}", err))
 }
 
 /// Open RocksDB database.
 #[cfg(feature = "kvdb-rocksdb")]
-pub fn open_database(config: &DatabaseSettings, col_meta: Option<u32>, db_type: &str) -> client::error::Result<Arc<KeyValueDB>> {
+pub fn open_database(
+	config: &DatabaseSettings,
+	col_meta: Option<u32>,
+	db_type: &str
+) -> client::error::Result<Arc<dyn KeyValueDB>> {
 	let mut db_config = DatabaseConfig::with_columns(Some(NUM_COLUMNS));
 	db_config.memory_budget = config.cache_size;
 	let path = config.path.to_str().ok_or_else(|| client::error::Error::Backend("Invalid database path".into()))?;
@@ -222,7 +226,12 @@ pub fn open_database(config: &DatabaseSettings, col_meta: Option<u32>, db_type: 
 }
 
 /// Read database column entry for the given block.
-pub fn read_db<Block>(db: &KeyValueDB, col_index: Option<u32>, col: Option<u32>, id: BlockId<Block>) -> client::error::Result<Option<DBValue>>
+pub fn read_db<Block>(
+	db: &dyn KeyValueDB,
+	col_index: Option<u32>,
+	col: Option<u32>,
+	id: BlockId<Block>
+) -> client::error::Result<Option<DBValue>>
 	where
 		Block: BlockT,
 {
@@ -234,7 +243,7 @@ pub fn read_db<Block>(db: &KeyValueDB, col_index: Option<u32>, col: Option<u32>,
 
 /// Read a header from the database.
 pub fn read_header<Block: BlockT>(
-	db: &KeyValueDB,
+	db: &dyn KeyValueDB,
 	col_index: Option<u32>,
 	col: Option<u32>,
 	id: BlockId<Block>,
@@ -252,7 +261,7 @@ pub fn read_header<Block: BlockT>(
 
 /// Required header from the database.
 pub fn require_header<Block: BlockT>(
-	db: &KeyValueDB,
+	db: &dyn KeyValueDB,
 	col_index: Option<u32>,
 	col: Option<u32>,
 	id: BlockId<Block>,
@@ -262,7 +271,7 @@ pub fn require_header<Block: BlockT>(
 }
 
 /// Read meta from the database.
-pub fn read_meta<Block>(db: &KeyValueDB, col_meta: Option<u32>, col_header: Option<u32>) -> Result<
+pub fn read_meta<Block>(db: &dyn KeyValueDB, col_meta: Option<u32>, col_header: Option<u32>) -> Result<
 	Meta<<<Block as BlockT>::Header as HeaderT>::Number, Block::Hash>,
 	client::error::Error,
 >

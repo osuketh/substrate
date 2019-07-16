@@ -24,7 +24,10 @@
 //!
 //! Finality implies canonicality but not vice-versa.
 
+#![warn(missing_docs)]
+
 pub mod light;
+pub mod offchain;
 
 mod cache;
 mod storage_cache;
@@ -38,6 +41,7 @@ use std::collections::HashMap;
 use client::backend::NewBlockState;
 use client::blockchain::HeaderBackend;
 use client::ExecutionStrategies;
+use client::backend::{StorageCollection, ChildStorageCollection};
 use parity_codec::{Decode, Encode};
 use hash_db::Hasher;
 use kvdb::{KeyValueDB, DBTransaction};
@@ -45,12 +49,13 @@ use trie::{MemoryDB, PrefixedMemoryDB, prefixed_key};
 use parking_lot::{Mutex, RwLock};
 use primitives::{H256, Blake2Hasher, ChangesTrieConfiguration, convert_hash};
 use primitives::storage::well_known_keys;
-use runtime_primitives::{generic::BlockId, Justification, StorageOverlay, ChildrenStorageOverlay};
-use runtime_primitives::traits::{
-	Block as BlockT, Header as HeaderT, NumberFor, Zero, One, Digest, DigestItem,
-	SaturatedConversion
+use runtime_primitives::{
+	generic::{BlockId, DigestItem}, Justification, StorageOverlay, ChildrenStorageOverlay,
+	BuildStorage
 };
-use runtime_primitives::BuildStorage;
+use runtime_primitives::traits::{
+	Block as BlockT, Header as HeaderT, NumberFor, Zero, One, SaturatedConversion
+};
 use state_machine::backend::Backend as StateBackend;
 use executor::RuntimeInfo;
 use state_machine::{CodeExecutor, DBValue};
@@ -69,8 +74,106 @@ use client::in_mem::Backend as InMemoryBackend;
 const CANONICALIZATION_DELAY: u64 = 4096;
 const MIN_BLOCKS_TO_KEEP_CHANGES_TRIES_FOR: u32 = 32768;
 
+/// Default value for storage cache child ratio.
+const DEFAULT_CHILD_RATIO: (usize, usize) = (1, 10);
+
 /// DB-backed patricia trie state, transaction type is an overlay of changes to commit.
-pub type DbState = state_machine::TrieBackend<Arc<state_machine::Storage<Blake2Hasher>>, Blake2Hasher>;
+pub type DbState = state_machine::TrieBackend<Arc<dyn state_machine::Storage<Blake2Hasher>>, Blake2Hasher>;
+
+/// A reference tracking state.
+///
+/// It makes sure that the hash we are using stays pinned in storage
+/// until this structure is dropped.
+pub struct RefTrackingState<Block: BlockT> {
+	state: DbState,
+	storage: Arc<StorageDb<Block>>,
+	parent_hash: Option<Block::Hash>,
+}
+
+impl<B: BlockT> RefTrackingState<B> {
+	fn new(state: DbState, storage: Arc<StorageDb<B>>, parent_hash: Option<B::Hash>) -> RefTrackingState<B> {
+		if let Some(hash) = &parent_hash {
+			storage.state_db.pin(hash);
+		}
+		RefTrackingState {
+			state,
+			parent_hash,
+			storage,
+		}
+	}
+}
+
+impl<B: BlockT> Drop for RefTrackingState<B> {
+	fn drop(&mut self) {
+		if let Some(hash) = &self.parent_hash {
+			self.storage.state_db.unpin(hash);
+		}
+	}
+}
+
+impl<B: BlockT> StateBackend<Blake2Hasher> for RefTrackingState<B> {
+	type Error =  <DbState as StateBackend<Blake2Hasher>>::Error;
+	type Transaction = <DbState as StateBackend<Blake2Hasher>>::Transaction;
+	type TrieBackendStorage = <DbState as StateBackend<Blake2Hasher>>::TrieBackendStorage;
+
+	fn storage(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
+		self.state.storage(key)
+	}
+
+	fn storage_hash(&self, key: &[u8]) -> Result<Option<H256>, Self::Error> {
+		self.state.storage_hash(key)
+	}
+
+	fn child_storage(&self, storage_key: &[u8], key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
+		self.state.child_storage(storage_key, key)
+	}
+
+	fn exists_storage(&self, key: &[u8]) -> Result<bool, Self::Error> {
+		self.state.exists_storage(key)
+	}
+
+	fn exists_child_storage(&self, storage_key: &[u8], key: &[u8]) -> Result<bool, Self::Error> {
+		self.state.exists_child_storage(storage_key, key)
+	}
+
+	fn for_keys_with_prefix<F: FnMut(&[u8])>(&self, prefix: &[u8], f: F) {
+		self.state.for_keys_with_prefix(prefix, f)
+	}
+
+	fn for_keys_in_child_storage<F: FnMut(&[u8])>(&self, storage_key: &[u8], f: F) {
+		self.state.for_keys_in_child_storage(storage_key, f)
+	}
+
+	fn storage_root<I>(&self, delta: I) -> (H256, Self::Transaction)
+		where
+			I: IntoIterator<Item=(Vec<u8>, Option<Vec<u8>>)>
+	{
+		self.state.storage_root(delta)
+	}
+
+	fn child_storage_root<I>(&self, storage_key: &[u8], delta: I) -> (Vec<u8>, bool, Self::Transaction)
+		where
+			I: IntoIterator<Item=(Vec<u8>, Option<Vec<u8>>)>,
+	{
+		self.state.child_storage_root(storage_key, delta)
+	}
+
+	fn pairs(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
+		self.state.pairs()
+	}
+
+	fn keys(&self, prefix: &[u8]) -> Vec<Vec<u8>> {
+		self.state.keys(prefix)
+	}
+
+	fn child_keys(&self, child_key: &[u8], prefix: &[u8]) -> Vec<Vec<u8>> {
+		self.state.child_keys(child_key, prefix)
+	}
+
+	fn as_trie_backend(&mut self) -> Option<&state_machine::TrieBackend<Self::TrieBackendStorage, Blake2Hasher>> {
+		self.state.as_trie_backend()
+	}
+}
 
 /// Database settings.
 pub struct DatabaseSettings {
@@ -78,6 +181,8 @@ pub struct DatabaseSettings {
 	pub cache_size: Option<usize>,
 	/// State cache size.
 	pub state_cache_size: usize,
+	/// Ratio of cache size dedicated to child tries.
+	pub state_cache_child_ratio: Option<(usize, usize)>,
 	/// Path to the database.
 	pub path: PathBuf,
 	/// Pruning mode.
@@ -90,7 +195,10 @@ pub fn new_client<E, S, Block, RA>(
 	executor: E,
 	genesis_storage: S,
 	execution_strategies: ExecutionStrategies,
-) -> Result<client::Client<Backend<Block>, client::LocalCallExecutor<Backend<Block>, E>, Block, RA>, client::error::Error>
+) -> Result<
+	client::Client<Backend<Block>,
+	client::LocalCallExecutor<Backend<Block>, E>, Block, RA>, client::error::Error
+>
 	where
 		Block: BlockT<Hash=H256>,
 		E: CodeExecutor<Blake2Hasher> + RuntimeInfo,
@@ -101,7 +209,7 @@ pub fn new_client<E, S, Block, RA>(
 	Ok(client::Client::new(backend, executor, genesis_storage, execution_strategies)?)
 }
 
-mod columns {
+pub(crate) mod columns {
 	pub const META: Option<u32> = crate::utils::COLUMN_META;
 	pub const STATE: Option<u32> = Some(1);
 	pub const STATE_META: Option<u32> = Some(2);
@@ -112,6 +220,8 @@ mod columns {
 	pub const JUSTIFICATION: Option<u32> = Some(6);
 	pub const CHANGES_TRIE: Option<u32> = Some(7);
 	pub const AUX: Option<u32> = Some(8);
+	/// Offchain workers local storage
+	pub const OFFCHAIN: Option<u32> = Some(9);
 }
 
 struct PendingBlock<Block: BlockT> {
@@ -122,7 +232,7 @@ struct PendingBlock<Block: BlockT> {
 }
 
 // wrapper that implements trait required for state_db
-struct StateMetaDb<'a>(&'a KeyValueDB);
+struct StateMetaDb<'a>(&'a dyn KeyValueDB);
 
 impl<'a> state_db::MetaDb for StateMetaDb<'a> {
 	type Error = io::Error;
@@ -134,13 +244,13 @@ impl<'a> state_db::MetaDb for StateMetaDb<'a> {
 
 /// Block database
 pub struct BlockchainDb<Block: BlockT> {
-	db: Arc<KeyValueDB>,
+	db: Arc<dyn KeyValueDB>,
 	meta: Arc<RwLock<Meta<NumberFor<Block>, Block::Hash>>>,
 	leaves: RwLock<LeafSet<Block::Hash, NumberFor<Block>>>,
 }
 
 impl<Block: BlockT> BlockchainDb<Block> {
-	fn new(db: Arc<KeyValueDB>) -> Result<Self, client::error::Error> {
+	fn new(db: Arc<dyn KeyValueDB>) -> Result<Self, client::error::Error> {
 		let meta = read_meta::<Block>(&*db, columns::META, columns::HEADER)?;
 		let leaves = LeafSet::read_from_db(&*db, columns::META, meta_keys::LEAF_PREFIX)?;
 		Ok(BlockchainDb {
@@ -180,15 +290,15 @@ impl<Block: BlockT> client::blockchain::HeaderBackend<Block> for BlockchainDb<Bl
 		utils::read_header(&*self.db, columns::KEY_LOOKUP, columns::HEADER, id)
 	}
 
-	fn info(&self) -> Result<client::blockchain::Info<Block>, client::error::Error> {
+	fn info(&self) -> client::blockchain::Info<Block> {
 		let meta = self.meta.read();
-		Ok(client::blockchain::Info {
+		client::blockchain::Info {
 			best_hash: meta.best_hash,
 			best_number: meta.best_number,
 			genesis_hash: meta.genesis_hash,
 			finalized_hash: meta.finalized_hash,
 			finalized_number: meta.finalized_number,
-		})
+		}
 	}
 
 	fn status(&self, id: BlockId<Block>) -> Result<client::blockchain::BlockStatus, client::error::Error> {
@@ -249,7 +359,7 @@ impl<Block: BlockT> client::blockchain::Backend<Block> for BlockchainDb<Block> {
 		Ok(self.meta.read().finalized_hash.clone())
 	}
 
-	fn cache(&self) -> Option<Arc<client::blockchain::Cache<Block>>> {
+	fn cache(&self) -> Option<Arc<dyn client::blockchain::Cache<Block>>> {
 		None
 	}
 
@@ -263,16 +373,17 @@ impl<Block: BlockT> client::blockchain::Backend<Block> for BlockchainDb<Block> {
 }
 
 impl<Block: BlockT> client::blockchain::ProvideCache<Block> for BlockchainDb<Block> {
-	fn cache(&self) -> Option<Arc<client::blockchain::Cache<Block>>> {
+	fn cache(&self) -> Option<Arc<dyn client::blockchain::Cache<Block>>> {
 		None
 	}
 }
 
 /// Database transaction
 pub struct BlockImportOperation<Block: BlockT, H: Hasher> {
-	old_state: CachingState<Blake2Hasher, DbState, Block>,
+	old_state: CachingState<Blake2Hasher, RefTrackingState<Block>, Block>,
 	db_updates: PrefixedMemoryDB<H>,
-	storage_updates: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+	storage_updates: StorageCollection,
+	child_storage_updates: ChildStorageCollection,
 	changes_trie_updates: MemoryDB<H>,
 	pending_block: Option<PendingBlock<Block>>,
 	aux_ops: Vec<(Vec<u8>, Option<Vec<u8>>)>,
@@ -295,7 +406,7 @@ impl<Block> client::backend::BlockImportOperation<Block, Blake2Hasher>
 for BlockImportOperation<Block, Blake2Hasher>
 where Block: BlockT<Hash=H256>,
 {
-	type State = CachingState<Blake2Hasher, DbState, Block>;
+	type State = CachingState<Blake2Hasher, RefTrackingState<Block>, Block>;
 
 	fn state(&self) -> Result<Option<&Self::State>, client::error::Error> {
 		Ok(Some(&self.old_state))
@@ -327,7 +438,11 @@ where Block: BlockT<Hash=H256>,
 		Ok(())
 	}
 
-	fn reset_storage(&mut self, top: StorageOverlay, children: ChildrenStorageOverlay) -> Result<H256, client::error::Error> {
+	fn reset_storage(
+		&mut self,
+		top: StorageOverlay,
+		children: ChildrenStorageOverlay
+	) -> Result<H256, client::error::Error> {
 
 		if top.iter().any(|(k, _)| well_known_keys::is_child_storage_key(k)) {
 			return Err(client::error::Error::GenesisInvalid.into());
@@ -364,8 +479,13 @@ where Block: BlockT<Hash=H256>,
 		Ok(())
 	}
 
-	fn update_storage(&mut self, update: Vec<(Vec<u8>, Option<Vec<u8>>)>) -> Result<(), client::error::Error> {
+	fn update_storage(
+		&mut self,
+		update: StorageCollection,
+		child_update: ChildStorageCollection,
+	) -> Result<(), client::error::Error> {
 		self.storage_updates = update;
+		self.child_storage_updates = child_update;
 		Ok(())
 	}
 
@@ -382,7 +502,7 @@ where Block: BlockT<Hash=H256>,
 }
 
 struct StorageDb<Block: BlockT> {
-	pub db: Arc<KeyValueDB>,
+	pub db: Arc<dyn KeyValueDB>,
 	pub state_db: StateDb<Block::Hash, Vec<u8>>,
 }
 
@@ -420,8 +540,9 @@ impl state_machine::Storage<Blake2Hasher> for DbGenesisStorage {
 	}
 }
 
+/// A database wrapper for changes tries.
 pub struct DbChangesTrieStorage<Block: BlockT> {
-	db: Arc<KeyValueDB>,
+	db: Arc<dyn KeyValueDB>,
 	meta: Arc<RwLock<Meta<NumberFor<Block>, Block::Hash>>>,
 	min_blocks_to_keep: Option<u32>,
 	_phantom: ::std::marker::PhantomData<Block>,
@@ -436,7 +557,13 @@ impl<Block: BlockT<Hash=H256>> DbChangesTrieStorage<Block> {
 	}
 
 	/// Prune obsolete changes tries.
-	pub fn prune(&self, config: &ChangesTrieConfiguration, tx: &mut DBTransaction, block_hash: Block::Hash, block_num: NumberFor<Block>) {
+	pub fn prune(
+		&self,
+		config: &ChangesTrieConfiguration,
+		tx: &mut DBTransaction,
+		block_hash: Block::Hash,
+		block_num: NumberFor<Block>,
+	) {
 		// never prune on archive nodes
 		let min_blocks_to_keep = match self.min_blocks_to_keep {
 			Some(min_blocks_to_keep) => min_blocks_to_keep,
@@ -558,6 +685,7 @@ where
 /// Otherwise, trie nodes are kept only from some recent blocks.
 pub struct Backend<Block: BlockT> {
 	storage: Arc<StorageDb<Block>>,
+	offchain_storage: offchain::LocalStorage,
 	changes_tries_storage: DbChangesTrieStorage<Block>,
 	/// None<*> means that the value hasn't been cached yet. Some(*) means that the value (either None or
 	/// Some(*)) has been cached and is valid.
@@ -565,53 +693,68 @@ pub struct Backend<Block: BlockT> {
 	blockchain: BlockchainDb<Block>,
 	canonicalization_delay: u64,
 	shared_cache: SharedCache<Block, Blake2Hasher>,
+	import_lock: Mutex<()>,
 }
 
 impl<Block: BlockT<Hash=H256>> Backend<Block> {
 	/// Create a new instance of database backend.
 	///
 	/// The pruning window is how old a block must be before the state is pruned.
-	pub fn new(config: DatabaseSettings, canonicalization_delay: u64) -> Result<Self, client::error::Error> {
+	pub fn new(config: DatabaseSettings, canonicalization_delay: u64) -> client::error::Result<Self> {
 		Self::new_inner(config, canonicalization_delay)
 	}
 
-	#[cfg(feature = "kvdb-rocksdb")]
 	fn new_inner(config: DatabaseSettings, canonicalization_delay: u64) -> Result<Self, client::error::Error> {
+		#[cfg(feature = "kvdb-rocksdb")]
 		let db = crate::utils::open_database(&config, columns::META, "full")?;
-		Backend::from_kvdb(db as Arc<_>, config.pruning, canonicalization_delay, config.state_cache_size)
+		#[cfg(not(feature = "kvdb-rocksdb"))]
+		let db = {
+			log::warn!("Running without the RocksDB feature. The database will NOT be saved.");
+			Arc::new(kvdb_memorydb::create(crate::utils::NUM_COLUMNS))
+		};
+		Self::from_kvdb(db as Arc<_>, canonicalization_delay, &config)
 	}
 
-	#[cfg(not(feature = "kvdb-rocksdb"))]
-	fn new_inner(config: DatabaseSettings, canonicalization_delay: u64) -> Result<Self, client::error::Error> {
-		log::warn!("Running without the RocksDB feature. The database will NOT be saved.");
-		let db = Arc::new(kvdb_memorydb::create(crate::utils::NUM_COLUMNS));
-		Backend::from_kvdb(db as Arc<_>, config.pruning, canonicalization_delay, config.state_cache_size)
-	}
-
+	/// Create new memory-backed client backend for tests.
 	#[cfg(any(test, feature = "test-helpers"))]
 	pub fn new_test(keep_blocks: u32, canonicalization_delay: u64) -> Self {
-		use utils::NUM_COLUMNS;
+		let db = Arc::new(kvdb_memorydb::create(crate::utils::NUM_COLUMNS));
+		Self::new_test_db(keep_blocks, canonicalization_delay, db as Arc<_>)
+	}
 
-		let db = Arc::new(::kvdb_memorydb::create(NUM_COLUMNS));
+	/// Creates a client backend with test settings.
+	#[cfg(any(test, feature = "test-helpers"))]
+	pub fn new_test_db(keep_blocks: u32, canonicalization_delay: u64, db: Arc<dyn KeyValueDB>) -> Self {
 
-		Backend::from_kvdb(
-			db as Arc<_>,
-			PruningMode::keep_blocks(keep_blocks),
+		let db_setting = DatabaseSettings {
+			cache_size: None,
+			state_cache_size: 16777216,
+			state_cache_child_ratio: Some((50, 100)),
+			path: Default::default(),
+			pruning: PruningMode::keep_blocks(keep_blocks),
+		};
+		Self::from_kvdb(
+			db,
 			canonicalization_delay,
-			16777216,
+			&db_setting,
 		).expect("failed to create test-db")
 	}
 
-	fn from_kvdb(db: Arc<KeyValueDB>, pruning: PruningMode, canonicalization_delay: u64, state_cache_size: usize) -> Result<Self, client::error::Error> {
-		let is_archive_pruning = pruning.is_archive();
+	fn from_kvdb(
+		db: Arc<dyn KeyValueDB>,
+		canonicalization_delay: u64,
+		config: &DatabaseSettings
+	) -> Result<Self, client::error::Error> {
+		let is_archive_pruning = config.pruning.is_archive();
 		let blockchain = BlockchainDb::new(db.clone())?;
 		let meta = blockchain.meta.clone();
 		let map_e = |e: state_db::Error<io::Error>| ::client::error::Error::from(format!("State database error: {:?}", e));
-		let state_db: StateDb<_, _> = StateDb::new(pruning, &StateMetaDb(&*db)).map_err(map_e)?;
+		let state_db: StateDb<_, _> = StateDb::new(config.pruning.clone(), &StateMetaDb(&*db)).map_err(map_e)?;
 		let storage_db = StorageDb {
 			db: db.clone(),
 			state_db,
 		};
+		let offchain_storage = offchain::LocalStorage::new(db.clone());
 		let changes_tries_storage = DbChangesTrieStorage {
 			db,
 			meta,
@@ -621,11 +764,16 @@ impl<Block: BlockT<Hash=H256>> Backend<Block> {
 
 		Ok(Backend {
 			storage: Arc::new(storage_db),
+			offchain_storage,
 			changes_tries_storage,
 			changes_trie_config: Mutex::new(None),
 			blockchain,
 			canonicalization_delay,
-			shared_cache: new_shared_cache(state_cache_size),
+			shared_cache: new_shared_cache(
+				config.state_cache_size,
+				config.state_cache_child_ratio.unwrap_or(DEFAULT_CHILD_RATIO),
+			),
+			import_lock: Default::default(),
 		})
 	}
 
@@ -651,7 +799,7 @@ impl<Block: BlockT<Hash=H256>> Backend<Block> {
 		}
 
 		// insert all other headers + bodies + justifications
-		let info = self.blockchain.info().unwrap();
+		let info = self.blockchain.info();
 		for (number, hash, header) in headers {
 			let id = BlockId::Hash(hash);
 			let justification = self.blockchain.justification(id).unwrap();
@@ -922,6 +1070,8 @@ impl<Block: BlockT<Hash=H256>> Backend<Block> {
 			let changes_trie_updates = operation.changes_trie_updates;
 
 			self.changes_tries_storage.commit(&mut transaction, changes_trie_updates);
+			let cache = operation.old_state.release(); // release state reference so that it can be finalized
+
 
 			if finalized {
 				// TODO: ensure best chain contains this block.
@@ -953,7 +1103,7 @@ impl<Block: BlockT<Hash=H256>> Backend<Block> {
 
 			meta_updates.push((hash, number, pending_block.leaf_state.is_best(), finalized));
 
-			Some((number, hash, enacted, retracted, displaced_leaf, is_best))
+			Some((number, hash, enacted, retracted, displaced_leaf, is_best, cache))
 		} else {
 			None
 		};
@@ -968,6 +1118,7 @@ impl<Block: BlockT<Hash=H256>> Backend<Block> {
 					hash.clone(),
 					(number.clone(), hash.clone())
 				)?;
+				meta_updates.push((hash, *number, true, false));
 			} else {
 				return Err(client::error::Error::UnknownBlock(format!("Cannot set head {:?}", set_head)))
 			}
@@ -975,7 +1126,7 @@ impl<Block: BlockT<Hash=H256>> Backend<Block> {
 
 		let write_result = self.storage.db.write(transaction).map_err(db_err);
 
-		if let Some((number, hash, enacted, retracted, displaced_leaf, is_best)) = imported {
+		if let Some((number, hash, enacted, retracted, displaced_leaf, is_best, mut cache)) = imported {
 			if let Err(e) = write_result {
 				let mut leaves = self.blockchain.leaves.write();
 				let mut undo = leaves.undo();
@@ -990,10 +1141,11 @@ impl<Block: BlockT<Hash=H256>> Backend<Block> {
 				return Err(e)
 			}
 
-			operation.old_state.sync_cache(
+			cache.sync_cache(
 				&enacted,
 				&retracted,
 				operation.storage_updates,
+				operation.child_storage_updates,
 				Some(hash),
 				Some(number),
 				|| is_best,
@@ -1090,8 +1242,9 @@ impl<Block> client::backend::AuxStore for Backend<Block> where Block: BlockT<Has
 impl<Block> client::backend::Backend<Block, Blake2Hasher> for Backend<Block> where Block: BlockT<Hash=H256> {
 	type BlockImportOperation = BlockImportOperation<Block, Blake2Hasher>;
 	type Blockchain = BlockchainDb<Block>;
-	type State = CachingState<Blake2Hasher, DbState, Block>;
+	type State = CachingState<Blake2Hasher, RefTrackingState<Block>, Block>;
 	type ChangesTrieStorage = DbChangesTrieStorage<Block>;
+	type OffchainStorage = offchain::LocalStorage;
 
 	fn begin_operation(&self) -> Result<Self::BlockImportOperation, client::error::Error> {
 		let old_state = self.state_at(BlockId::Hash(Default::default()))?;
@@ -1100,6 +1253,7 @@ impl<Block> client::backend::Backend<Block, Blake2Hasher> for Backend<Block> whe
 			old_state,
 			db_updates: PrefixedMemoryDB::default(),
 			storage_updates: Default::default(),
+			child_storage_updates: Default::default(),
 			changes_trie_updates: MemoryDB::default(),
 			aux_ops: Vec::new(),
 			finalized_blocks: Vec::new(),
@@ -1164,9 +1318,13 @@ impl<Block> client::backend::Backend<Block, Blake2Hasher> for Backend<Block> whe
 		Some(&self.changes_tries_storage)
 	}
 
+	fn offchain_storage(&self) -> Option<Self::OffchainStorage> {
+		Some(self.offchain_storage.clone())
+	}
+
 	fn revert(&self, n: NumberFor<Block>) -> Result<NumberFor<Block>, client::error::Error> {
-		let mut best = self.blockchain.info()?.best_number;
-		let finalized = self.blockchain.info()?.finalized_number;
+		let mut best = self.blockchain.info().best_number;
+		let finalized = self.blockchain.info().finalized_number;
 		let revertible = best - finalized;
 		let n = if revertible < n { revertible } else { n };
 
@@ -1182,7 +1340,7 @@ impl<Block> client::backend::Backend<Block, Blake2Hasher> for Backend<Block> whe
 						|| client::error::Error::UnknownBlock(
 							format!("Error reverting to {}. Block hash not found.", best)))?;
 
-					best -= One::one();  // prev block
+					best -= One::one();	// prev block
 					let hash = self.blockchain.hash(best)?.ok_or_else(
 						|| client::error::Error::UnknownBlock(
 							format!("Error reverting to {}. Block hash not found.", best)))?;
@@ -1217,7 +1375,8 @@ impl<Block> client::backend::Backend<Block, Blake2Hasher> for Backend<Block> whe
 			BlockId::Hash(h) if h == Default::default() => {
 				let genesis_storage = DbGenesisStorage::new();
 				let root = genesis_storage.0.clone();
-				let state = DbState::new(Arc::new(genesis_storage), root);
+				let db_state = DbState::new(Arc::new(genesis_storage), root);
+				let state = RefTrackingState::new(db_state, self.storage.clone(), None);
 				return Ok(CachingState::new(state, self.shared_cache.clone(), None));
 			},
 			_ => {}
@@ -1228,7 +1387,8 @@ impl<Block> client::backend::Backend<Block, Blake2Hasher> for Backend<Block> whe
 				let hash = hdr.hash();
 				if !self.storage.state_db.is_pruned(&hash, (*hdr.number()).saturated_into::<u64>()) {
 					let root = H256::from_slice(hdr.state_root().as_ref());
-					let state = DbState::new(self.storage.clone(), root);
+					let db_state = DbState::new(self.storage.clone(), root);
+					let state = RefTrackingState::new(db_state, self.storage.clone(), Some(hash.clone()));
 					Ok(CachingState::new(state, self.shared_cache.clone(), Some(hash)))
 				} else {
 					Err(client::error::Error::UnknownBlock(format!("State already discarded for {:?}", block)))
@@ -1243,12 +1403,16 @@ impl<Block> client::backend::Backend<Block, Blake2Hasher> for Backend<Block> whe
 		!self.storage.state_db.is_pruned(hash, number.saturated_into::<u64>())
 	}
 
-	fn destroy_state(&self, mut state: Self::State) -> Result<(), client::error::Error> {
-		if let Some(hash) = state.parent_hash.clone() {
+	fn destroy_state(&self, state: Self::State) -> Result<(), client::error::Error> {
+		if let Some(hash) = state.cache.parent_hash.clone() {
 			let is_best = || self.blockchain.meta.read().best_hash == hash;
-			state.sync_cache(&[], &[], vec![], None, None, is_best);
+			state.release().sync_cache(&[], &[], vec![], vec![], None, None, is_best);
 		}
 		Ok(())
+	}
+
+	fn get_import_lock(&self) -> &Mutex<()> {
+		&self.import_lock
 	}
 }
 
@@ -1293,7 +1457,6 @@ mod tests {
 		changes: Vec<(Vec<u8>, Vec<u8>)>,
 		extrinsics_root: H256,
 	) -> H256 {
-		use runtime_primitives::generic::DigestItem;
 		use runtime_primitives::testing::Digest;
 
 		let (changes_root, changes_trie_update) = prepare_changes(changes);
@@ -1367,8 +1530,8 @@ mod tests {
 			db.storage.db.clone()
 		};
 
-		let backend = Backend::<Block>::from_kvdb(backing, PruningMode::keep_blocks(1), 0, 16777216).unwrap();
-		assert_eq!(backend.blockchain().info().unwrap().best_number, 9);
+		let backend = Backend::<Block>::new_test_db(1, 0, backing);
+		assert_eq!(backend.blockchain().info().best_number, 9);
 		for i in 0..10 {
 			assert!(backend.blockchain().hash(i).unwrap().is_some())
 		}

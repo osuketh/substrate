@@ -110,24 +110,24 @@ where
 		manager: ExecutionManager<F>,
 		native_call: Option<NC>,
 		side_effects_handler: Option<&mut O>,
-	) -> Result<(NativeOrEncoded<R>, S::Transaction, Option<MemoryDB<H>>), error::Error>;
+	) -> Result<(NativeOrEncoded<R>, (S::Transaction, H::Out), Option<MemoryDB<H>>), error::Error>;
 
 	/// Execute a call to a contract on top of given state, gathering execution proof.
 	///
 	/// No changes are made.
 	fn prove_at_state<S: state_machine::Backend<H>>(
 		&self,
-		state: S,
+		mut state: S,
 		overlay: &mut OverlayedChanges,
 		method: &str,
 		call_data: &[u8]
 	) -> Result<(Vec<u8>, Vec<Vec<u8>>), error::Error> {
-		let trie_state = state.try_into_trie_backend()
+		let trie_state = state.as_trie_backend()
 			.ok_or_else(||
 				Box::new(state_machine::ExecutionError::UnableToGenerateProof)
-					as Box<state_machine::Error>
+					as Box<dyn state_machine::Error>
 			)?;
-		self.prove_at_trie_state(&trie_state, overlay, method, call_data)
+		self.prove_at_trie_state(trie_state, overlay, method, call_data)
 	}
 
 	/// Execute a call to a contract on top of given trie state, gathering execution proof.
@@ -239,18 +239,18 @@ where
 			_ => {},
 		}
 
-		let state = self.backend.state_at(*at)?;
+		let mut state = self.backend.state_at(*at)?;
 
 		match recorder {
 			Some(recorder) => {
-				let trie_state = state.try_into_trie_backend()
+				let trie_state = state.as_trie_backend()
 					.ok_or_else(||
 						Box::new(state_machine::ExecutionError::UnableToGenerateProof)
-							as Box<state_machine::Error>
+							as Box<dyn state_machine::Error>
 					)?;
 
 				let backend = state_machine::ProvingBackend::new_with_recorder(
-					&trie_state,
+					trie_state,
 					recorder.clone()
 				);
 
@@ -314,7 +314,11 @@ where
 		manager: ExecutionManager<F>,
 		native_call: Option<NC>,
 		side_effects_handler: Option<&mut O>,
-	) -> error::Result<(NativeOrEncoded<R>, S::Transaction, Option<MemoryDB<Blake2Hasher>>)> {
+	) -> error::Result<(
+		NativeOrEncoded<R>,
+		(S::Transaction, <Blake2Hasher as Hasher>::Out),
+		Option<MemoryDB<Blake2Hasher>>,
+	)> {
 		state_machine::new(
 			state,
 			self.backend.changes_trie_storage(),

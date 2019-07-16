@@ -69,7 +69,7 @@ pub use self::hash::{H160, H256, H512, convert_hash};
 pub use self::uint::U256;
 pub use changes_trie::ChangesTrieConfiguration;
 #[cfg(feature = "std")]
-pub use crypto::{DeriveJunction, Pair};
+pub use crypto::{DeriveJunction, Pair, Public};
 
 pub use hash_db::Hasher;
 // Switch back to Blake after PoC-3 is out
@@ -86,7 +86,7 @@ pub enum ExecutionContext {
 	/// Context used for block construction.
 	BlockConstruction,
 	/// Offchain worker context.
-	OffchainWorker(Box<offchain::Externalities>),
+	OffchainWorker(Box<dyn offchain::Externalities>),
 	/// Context used for other calls.
 	Other,
 }

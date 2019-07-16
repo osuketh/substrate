@@ -21,7 +21,10 @@ use std::ops::Deref;
 use std::sync::Arc;
 use log::{debug, warn};
 use hash_db::{self, Hasher};
-use trie::{TrieDB, Trie, MemoryDB, PrefixedMemoryDB, DBValue, TrieError, default_child_trie_root, read_trie_value, read_child_trie_value, for_keys_in_child_trie};
+use trie::{
+	TrieDB, Trie, MemoryDB, PrefixedMemoryDB, DBValue, TrieError,
+	default_child_trie_root, read_trie_value, read_child_trie_value, for_keys_in_child_trie,
+};
 use crate::backend::Consolidate;
 
 /// Patricia trie-based storage trait.
@@ -153,8 +156,8 @@ impl<'a,
 > hash_db::AsPlainDB<H::Out, DBValue>
 	for Ephemeral<'a, S, H>
 {
-	fn as_plain_db<'b>(&'b self) -> &'b (hash_db::PlainDB<H::Out, DBValue> + 'b) { self }
-	fn as_plain_db_mut<'b>(&'b mut self) -> &'b mut (hash_db::PlainDB<H::Out, DBValue> + 'b) { self }
+	fn as_plain_db<'b>(&'b self) -> &'b (dyn hash_db::PlainDB<H::Out, DBValue> + 'b) { self }
+	fn as_plain_db_mut<'b>(&'b mut self) -> &'b mut (dyn hash_db::PlainDB<H::Out, DBValue> + 'b) { self }
 }
 
 impl<'a,
@@ -163,8 +166,8 @@ impl<'a,
 > hash_db::AsHashDB<H, DBValue>
 	for Ephemeral<'a, S, H>
 {
-	fn as_hash_db<'b>(&'b self) -> &'b (hash_db::HashDB<H, DBValue> + 'b) { self }
-	fn as_hash_db_mut<'b>(&'b mut self) -> &'b mut (hash_db::HashDB<H, DBValue> + 'b) { self }
+	fn as_hash_db<'b>(&'b self) -> &'b (dyn hash_db::HashDB<H, DBValue> + 'b) { self }
+	fn as_hash_db_mut<'b>(&'b mut self) -> &'b mut (dyn hash_db::HashDB<H, DBValue> + 'b) { self }
 }
 
 impl<'a, S: TrieBackendStorage<H>, H: Hasher> Ephemeral<'a, S, H> {
@@ -275,7 +278,7 @@ pub trait TrieBackendStorage<H: Hasher>: Send + Sync {
 }
 
 // This implementation is used by normal storage trie clients.
-impl<H: Hasher> TrieBackendStorage<H> for Arc<Storage<H>> {
+impl<H: Hasher> TrieBackendStorage<H> for Arc<dyn Storage<H>> {
 	type Overlay = PrefixedMemoryDB<H>;
 
 	fn get(&self, key: &H::Out, prefix: &[u8]) -> Result<Option<DBValue>, String> {

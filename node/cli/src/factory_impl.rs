@@ -38,7 +38,7 @@ use inherents::InherentData;
 use timestamp;
 use finality_tracker;
 
-// TODO get via api: <timestamp::Module<T>>::minimum_period(). See #2587.
+// TODO get via api: <T as timestamp::Trait>::MinimumPeriod::get(). See #2587.
 const MINIMUM_PERIOD: u64 = 99;
 
 pub struct FactoryState<N> {
@@ -170,13 +170,13 @@ impl RuntimeAdapter for FactoryState<Number> {
 
 	/// Generates a random `AccountId` from `seed`.
 	fn gen_random_account_id(seed: &Self::Number) -> Self::AccountId {
-		let pair: sr25519::Pair = sr25519::Pair::from_seed(gen_seed_bytes(*seed));
+		let pair: sr25519::Pair = sr25519::Pair::from_seed(&gen_seed_bytes(*seed));
 		pair.public().into()
 	}
 
 	/// Generates a random `Secret` from `seed`.
 	fn gen_random_account_secret(seed: &Self::Number) -> Self::Secret {
-		let pair: sr25519::Pair = sr25519::Pair::from_seed(gen_seed_bytes(*seed));
+		let pair: sr25519::Pair = sr25519::Pair::from_seed(&gen_seed_bytes(*seed));
 		pair
 	}
 

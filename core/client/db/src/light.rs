@@ -31,11 +31,8 @@ use client::error::{Error as ClientError, Result as ClientResult};
 use client::light::blockchain::Storage as LightBlockchainStorage;
 use parity_codec::{Decode, Encode};
 use primitives::Blake2Hasher;
-use runtime_primitives::generic::BlockId;
-use runtime_primitives::traits::{
-	Block as BlockT, Header as HeaderT,
-	Zero, One, NumberFor, Digest, DigestItem,
-};
+use runtime_primitives::generic::{DigestItem, BlockId};
+use runtime_primitives::traits::{Block as BlockT, Header as HeaderT, Zero, One, NumberFor};
 use consensus_common::well_known_cache_keys;
 use crate::cache::{DbCacheSync, DbCache, ComplexBlockId, EntryType as CacheEntryType};
 use crate::utils::{self, meta_keys, Meta, db_err, read_db, block_id_to_lookup_key, read_meta};
@@ -59,7 +56,7 @@ const CHANGES_TRIE_CHT_PREFIX: u8 = 1;
 /// Light blockchain storage. Stores most recent headers + CHTs for older headers.
 /// Locks order: meta, leaves, cache.
 pub struct LightStorage<Block: BlockT> {
-	db: Arc<KeyValueDB>,
+	db: Arc<dyn KeyValueDB>,
 	meta: RwLock<Meta<NumberFor<Block>, Block::Hash>>,
 	leaves: RwLock<LeafSet<Block::Hash, NumberFor<Block>>>,
 	cache: Arc<DbCacheSync<Block>>,
@@ -87,6 +84,7 @@ impl<Block> LightStorage<Block>
 		Self::from_kvdb(db as Arc<_>)
 	}
 
+	/// Create new memory-backed `LightStorage` for tests.
 	#[cfg(any(test, feature = "test-helpers"))]
 	pub fn new_test() -> Self {
 		use utils::NUM_COLUMNS;
@@ -96,7 +94,7 @@ impl<Block> LightStorage<Block>
 		Self::from_kvdb(db as Arc<_>).expect("failed to create test-db")
 	}
 
-	fn from_kvdb(db: Arc<KeyValueDB>) -> ClientResult<Self> {
+	fn from_kvdb(db: Arc<dyn KeyValueDB>) -> ClientResult<Self> {
 		let meta = read_meta::<Block>(&*db, columns::META, columns::HEADER)?;
 		let leaves = LeafSet::read_from_db(&*db, columns::META, meta_keys::LEAF_PREFIX)?;
 		let cache = DbCache::new(
@@ -155,15 +153,15 @@ impl<Block> BlockchainHeaderBackend<Block> for LightStorage<Block>
 		utils::read_header(&*self.db, columns::KEY_LOOKUP, columns::HEADER, id)
 	}
 
-	fn info(&self) -> ClientResult<BlockchainInfo<Block>> {
+	fn info(&self) -> BlockchainInfo<Block> {
 		let meta = self.meta.read();
-		Ok(BlockchainInfo {
+		BlockchainInfo {
 			best_hash: meta.best_hash,
 			best_number: meta.best_number,
 			genesis_hash: meta.genesis_hash,
 			finalized_hash: meta.finalized_hash,
 			finalized_number: meta.finalized_number,
-		})
+		}
 	}
 
 	fn status(&self, id: BlockId<Block>) -> ClientResult<BlockStatus> {
@@ -499,6 +497,7 @@ impl<Block> LightBlockchainStorage<Block> for LightStorage<Block>
 			let mut transaction = DBTransaction::new();
 			self.set_head_with_transaction(&mut transaction, hash.clone(), (number.clone(), hash.clone()))?;
 			self.db.write(transaction).map_err(db_err)?;
+			self.update_meta(hash, header.number().clone(), true, false);
 			Ok(())
 		} else {
 			Err(ClientError::UnknownBlock(format!("Cannot set head {:?}", id)))
@@ -557,7 +556,7 @@ impl<Block> LightBlockchainStorage<Block> for LightStorage<Block>
 		Ok(self.meta.read().finalized_hash.clone())
 	}
 
-	fn cache(&self) -> Option<Arc<BlockchainCache<Block>>> {
+	fn cache(&self) -> Option<Arc<dyn BlockchainCache<Block>>> {
 		Some(self.cache.clone())
 	}
 }
@@ -574,11 +573,10 @@ pub(crate) mod tests {
 	use client::cht;
 	use runtime_primitives::generic::DigestItem;
 	use runtime_primitives::testing::{H256 as Hash, Header, Block as RawBlock, ExtrinsicWrapper};
-	use runtime_primitives::traits::AuthorityIdFor;
 	use super::*;
 
 	type Block = RawBlock<ExtrinsicWrapper<u32>>;
-	type AuthorityId = AuthorityIdFor<Block>;
+	type AuthorityId = primitives::ed25519::Public;
 
 	pub fn default_header(parent: &Hash, number: u64) -> Header {
 		Header {
@@ -655,12 +653,12 @@ pub(crate) mod tests {
 	fn returns_info() {
 		let db = LightStorage::new_test();
 		let genesis_hash = insert_block(&db, HashMap::new(), || default_header(&Default::default(), 0));
-		let info = db.info().unwrap();
+		let info = db.info();
 		assert_eq!(info.best_hash, genesis_hash);
 		assert_eq!(info.best_number, 0);
 		assert_eq!(info.genesis_hash, genesis_hash);
 		let best_hash = insert_block(&db, HashMap::new(), || default_header(&genesis_hash, 1));
-		let info = db.info().unwrap();
+		let info = db.info();
 		assert_eq!(info.best_hash, best_hash);
 		assert_eq!(info.best_number, 1);
 		assert_eq!(info.genesis_hash, genesis_hash);
@@ -871,7 +869,7 @@ pub(crate) mod tests {
 	fn authorities_are_cached() {
 		let db = LightStorage::new_test();
 
-		fn run_checks(db: &LightStorage<Block>, max: u64, checks: &[(u64, Option<Vec<AuthorityIdFor<Block>>>)]) {
+		fn run_checks(db: &LightStorage<Block>, max: u64, checks: &[(u64, Option<Vec<AuthorityId>>)]) {
 			for (at, expected) in checks.iter().take_while(|(at, _)| *at <= max) {
 				let actual = get_authorities(db.cache(), BlockId::Number(*at));
 				assert_eq!(*expected, actual);
@@ -888,7 +886,7 @@ pub(crate) mod tests {
 			map
 		}
 
-		fn get_authorities(cache: &BlockchainCache<Block>, at: BlockId<Block>) -> Option<Vec<AuthorityId>> {
+		fn get_authorities(cache: &dyn BlockchainCache<Block>, at: BlockId<Block>) -> Option<Vec<AuthorityId>> {
 			cache.get_at(&well_known_cache_keys::AUTHORITIES, &at).and_then(|val| Decode::decode(&mut &val[..]))
 		}
 
@@ -1034,12 +1032,12 @@ pub(crate) mod tests {
 	fn database_is_reopened() {
 		let db = LightStorage::new_test();
 		let hash0 = insert_final_block(&db, HashMap::new(), || default_header(&Default::default(), 0));
-		assert_eq!(db.info().unwrap().best_hash, hash0);
+		assert_eq!(db.info().best_hash, hash0);
 		assert_eq!(db.header(BlockId::Hash(hash0)).unwrap().unwrap().hash(), hash0);
 
 		let db = db.db;
 		let db = LightStorage::from_kvdb(db).unwrap();
-		assert_eq!(db.info().unwrap().best_hash, hash0);
+		assert_eq!(db.info().best_hash, hash0);
 		assert_eq!(db.header(BlockId::Hash::<Block>(hash0)).unwrap().unwrap().hash(), hash0);
 	}
 

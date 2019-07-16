@@ -51,16 +51,21 @@
 pub use timestamp;
 
 use rstd::{result, prelude::*};
-use srml_support::storage::StorageValue;
-use srml_support::{decl_storage, decl_module};
-use primitives::traits::{SaturatedConversion, Saturating, Zero, One};
+use parity_codec::Encode;
+use srml_support::{decl_storage, decl_module, Parameter, storage::StorageValue, traits::Get};
+use primitives::{
+	traits::{SaturatedConversion, Saturating, Zero, One, Member, TypedKey},
+	generic::DigestItem,
+};
 use timestamp::OnTimestampSet;
 #[cfg(feature = "std")]
 use timestamp::TimestampInherentData;
-use parity_codec::{Encode, Decode};
 use inherents::{RuntimeString, InherentIdentifier, InherentData, ProvideInherent, MakeFatalError};
 #[cfg(feature = "std")]
 use inherents::{InherentDataProviders, ProvideInherentData};
+use substrate_consensus_aura_primitives::{AURA_ENGINE_ID, ConsensusLog};
+#[cfg(feature = "std")]
+use parity_codec::Decode;
 
 mod mock;
 mod tests;
@@ -149,12 +154,18 @@ impl HandleReport for () {
 pub trait Trait: timestamp::Trait {
 	/// The logic for handling reports.
 	type HandleReport: HandleReport;
+
+	/// The identifier type for an authority.
+	type AuthorityId: Member + Parameter + TypedKey + Default;
 }
 
 decl_storage! {
 	trait Store for Module<T: Trait> as Aura {
 		/// The last timestamp.
 		LastTimestamp get(last) build(|_| 0.into()): T::Moment;
+
+		/// The current authorities
+		pub Authorities get(authorities) config(): Vec<T::AuthorityId>;
 	}
 }
 
@@ -162,8 +173,45 @@ decl_module! {
 	pub struct Module<T: Trait> for enum Call where origin: T::Origin { }
 }
 
+impl<T: Trait> Module<T> {
+	fn change_authorities(new: Vec<T::AuthorityId>) {
+		<Authorities<T>>::put(&new);
+
+		let log: DigestItem<T::Hash> = DigestItem::Consensus(
+			AURA_ENGINE_ID,
+			ConsensusLog::AuthoritiesChange(new).encode()
+		);
+		<system::Module<T>>::deposit_log(log.into());
+	}
+}
+
+impl<T: Trait> session::OneSessionHandler<T::AccountId> for Module<T> {
+	type Key = T::AuthorityId;
+
+	fn on_new_session<'a, I: 'a>(changed: bool, validators: I)
+		where I: Iterator<Item=(&'a T::AccountId, T::AuthorityId)>
+	{
+		// instant changes
+		if changed {
+			let next_authorities = validators.map(|(_, k)| k).collect::<Vec<_>>();
+			let last_authorities = <Module<T>>::authorities();
+			if next_authorities != last_authorities {
+				Self::change_authorities(next_authorities);
+			}
+		}
+	}
+	fn on_disabled(i: usize) {
+		let log: DigestItem<T::Hash> = DigestItem::Consensus(
+			AURA_ENGINE_ID,
+			ConsensusLog::<T::AuthorityId>::OnDisabled(i as u64).encode(),
+		);
+
+		<system::Module<T>>::deposit_log(log.into());
+	}
+}
+
 /// A report of skipped authorities in Aura.
-#[derive(Clone, Encode, Decode, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "std", derive(Debug))]
 pub struct AuraReport {
 	// The first skipped slot.
@@ -195,7 +243,7 @@ impl<T: Trait> Module<T> {
 	pub fn slot_duration() -> T::Moment {
 		// we double the minimum block-period so each author can always propose within
 		// the majority of its slot.
-		<timestamp::Module<T>>::minimum_period().saturating_mul(2.into())
+		<T as timestamp::Trait>::MinimumPeriod::get().saturating_mul(2.into())
 	}
 
 	fn on_timestamp_set<H: HandleReport>(now: T::Moment, slot_duration: T::Moment) {
@@ -235,7 +283,8 @@ pub struct StakingSlasher<T>(::rstd::marker::PhantomData<T>);
 
 impl<T: staking::Trait + Trait> HandleReport for StakingSlasher<T> {
 	fn handle_report(report: AuraReport) {
-		let validators = session::Module::<T>::validators();
+		use staking::SessionInterface;
+		let validators = T::SessionInterface::validators();
 
 		report.punish(
 			validators.len(),

@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 use std::ops::Deref;
 use lazy_static::lazy_static;
-use substrate_primitives::{sr25519::{Pair, Public, Signature}, Pair as PairT, H256};
+use substrate_primitives::{sr25519::{Pair, Public, Signature}, Pair as PairT, Public as PublicT, H256};
 pub use substrate_primitives::sr25519;
 
 /// Set of test accounts.

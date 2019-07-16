@@ -42,7 +42,7 @@ pub enum Error {
 	ApplyExtrinsicFailed(ApplyError),
 	/// Execution error.
 	#[display(fmt = "Execution: {}", _0)]
-	Execution(Box<state_machine::Error>),
+	Execution(Box<dyn state_machine::Error>),
 	/// Blockchain error.
 	#[display(fmt = "Blockchain: {}", _0)]
 	Blockchain(Box<Error>),
@@ -94,13 +94,16 @@ pub enum Error {
 	/// Hash that is required for building CHT is missing.
 	#[display(fmt = "Failed to get hash of block for building CHT")]
 	MissingHashRequiredForCHT,
+	/// Invalid calculated state root on block import.
+	#[display(fmt = "Calculated state root does not match.")]
+	InvalidStateRoot,
 	/// A convenience variant for String
 	#[display(fmt = "{}", _0)]
 	Msg(String),
 }
 
 impl error::Error for Error {
-	fn source(&self) -> Option<&(error::Error + 'static)> {
+	fn source(&self) -> Option<&(dyn error::Error + 'static)> {
 		match self {
 			Error::Consensus(e) => Some(e),
 			Error::Blockchain(e) => Some(e),
@@ -128,7 +131,7 @@ impl Error {
 	}
 
 	/// Chain a state error.
-	pub fn from_state(e: Box<state_machine::Error + Send>) -> Self {
+	pub fn from_state(e: Box<dyn state_machine::Error + Send>) -> Self {
 		Error::Execution(e)
 	}
 }

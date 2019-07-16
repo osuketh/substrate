@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use log::{debug, warn, info};
 use parity_codec::{Decode, Encode};
 use futures::prelude::*;
-use tokio::timer::Delay;
+use tokio_timer::Delay;
 use parking_lot::RwLock;
 
 use client::{
@@ -46,14 +46,21 @@ use crate::{
 
 use consensus_common::SelectChain;
 
-use crate::authorities::SharedAuthoritySet;
+use crate::authorities::{AuthoritySet, SharedAuthoritySet};
 use crate::consensus_changes::SharedConsensusChanges;
 use crate::justification::GrandpaJustification;
 use crate::until_imported::UntilVoteTargetImported;
+use fg_primitives::{AuthorityId, AuthoritySignature};
 
-use ed25519::Public as AuthorityId;
+type HistoricalVotes<Block> = grandpa::HistoricalVotes<
+	<Block as BlockT>::Hash,
+	NumberFor<Block>,
+	AuthoritySignature,
+	AuthorityId,
+>;
 
-/// Data about a completed round.
+/// Data about a completed round. The set of votes that is stored must be
+/// minimal, i.e. at most one equivocation is stored per voter.
 #[derive(Debug, Clone, Decode, Encode, PartialEq)]
 pub struct CompletedRound<Block: BlockT> {
 	/// The round number.
@@ -66,11 +73,13 @@ pub struct CompletedRound<Block: BlockT> {
 	pub votes: Vec<SignedMessage<Block>>,
 }
 
-// Data about last completed rounds. Stores NUM_LAST_COMPLETED_ROUNDS and always
+// Data about last completed rounds within a single voter set. Stores NUM_LAST_COMPLETED_ROUNDS and always
 // contains data about at least one round (genesis).
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompletedRounds<Block: BlockT> {
-	inner: VecDeque<CompletedRound<Block>>,
+	rounds: VecDeque<CompletedRound<Block>>,
+	set_id: u64,
+	voters: Vec<AuthorityId>,
 }
 
 // NOTE: the current strategy for persisting completed rounds is very naive
@@ -80,34 +89,51 @@ const NUM_LAST_COMPLETED_ROUNDS: usize = 2;
 
 impl<Block: BlockT> Encode for CompletedRounds<Block> {
 	fn encode(&self) -> Vec<u8> {
-		Vec::from_iter(&self.inner).encode()
+		let v = Vec::from_iter(&self.rounds);
+		(&v, &self.set_id, &self.voters).encode()
 	}
 }
 
 impl<Block: BlockT> Decode for CompletedRounds<Block> {
 	fn decode<I: parity_codec::Input>(value: &mut I) -> Option<Self> {
-		Vec::<CompletedRound<Block>>::decode(value)
-			.map(|completed_rounds| CompletedRounds {
-				inner: completed_rounds.into(),
+		<(Vec<CompletedRound<Block>>, u64, Vec<AuthorityId>)>::decode(value)
+			.map(|(rounds, set_id, voters)| CompletedRounds {
+				rounds: rounds.into(),
+				set_id,
+				voters,
 			})
 	}
 }
 
 impl<Block: BlockT> CompletedRounds<Block> {
 	/// Create a new completed rounds tracker with NUM_LAST_COMPLETED_ROUNDS capacity.
-	pub fn new(genesis: CompletedRound<Block>) -> CompletedRounds<Block> {
-		let mut inner = VecDeque::with_capacity(NUM_LAST_COMPLETED_ROUNDS);
-		inner.push_back(genesis);
-		CompletedRounds { inner }
+	pub(crate) fn new(
+		genesis: CompletedRound<Block>,
+		set_id: u64,
+		voters: &AuthoritySet<Block::Hash, NumberFor<Block>>,
+	)
+		-> CompletedRounds<Block>
+	{
+		let mut rounds = VecDeque::with_capacity(NUM_LAST_COMPLETED_ROUNDS);
+		rounds.push_back(genesis);
+
+		let voters = voters.current().1.iter().map(|(a, _)| a.clone()).collect();
+		CompletedRounds { rounds, set_id, voters }
 	}
 
+	/// Get the set-id and voter set of the completed rounds.
+	pub fn set_info(&self) -> (u64, &[AuthorityId]) {
+		(self.set_id, &self.voters[..])
+	}
+
+	/// Iterate over all completed rounds.
 	pub fn iter(&self) -> impl Iterator<Item=&CompletedRound<Block>> {
-		self.inner.iter()
+		self.rounds.iter()
 	}
 
 	/// Returns the last (latest) completed round.
 	pub fn last(&self) -> &CompletedRound<Block> {
-		self.inner.back()
+		self.rounds.back()
 			.expect("inner is never empty; always contains at least genesis; qed")
 	}
 
@@ -118,11 +144,11 @@ impl<Block: BlockT> CompletedRounds<Block> {
 			return false;
 		}
 
-		if self.inner.len() == NUM_LAST_COMPLETED_ROUNDS {
-			self.inner.pop_front();
+		if self.rounds.len() == NUM_LAST_COMPLETED_ROUNDS {
+			self.rounds.pop_front();
 		}
 
-		self.inner.push_back(completed_round);
+		self.rounds.push_back(completed_round);
 
 		true
 	}
@@ -157,6 +183,16 @@ impl<Block: BlockT> VoterSetState<Block> {
 				completed_rounds.clone(),
 			VoterSetState::Paused { completed_rounds } =>
 				completed_rounds.clone(),
+		}
+	}
+
+	/// Returns the last completed round.
+	pub(crate) fn last_completed_round(&self) -> CompletedRound<Block> {
+		match self {
+			VoterSetState::Live { completed_rounds, .. } =>
+				completed_rounds.last().clone(),
+			VoterSetState::Paused { completed_rounds } =>
+				completed_rounds.last().clone(),
 		}
 	}
 }
@@ -618,7 +654,7 @@ where
 		round: u64,
 		state: RoundState<Block::Hash, NumberFor<Block>>,
 		base: (Block::Hash, NumberFor<Block>),
-		votes: Vec<SignedMessage<Block>>,
+		historical_votes: &HistoricalVotes<Block>,
 	) -> Result<(), Self::Error> {
 		debug!(
 			target: "afg", "Voter {} completed round {} in set {}. Estimate = {:?}, Finalized in round = {:?}",
@@ -631,6 +667,9 @@ where
 
 		self.update_voter_set_state(|voter_set_state| {
 			let mut completed_rounds = voter_set_state.completed_rounds();
+
+			// TODO: Future integration will store the prevote and precommit index. See #2611.
+			let votes = historical_votes.seen().clone();
 
 			// NOTE: the Environment assumes that rounds are *always* completed in-order.
 			if !completed_rounds.push(CompletedRound {
@@ -662,7 +701,7 @@ where
 
 		#[allow(deprecated)]
 		let blockchain = self.inner.backend().blockchain();
-		let status = blockchain.info()?;
+		let status = blockchain.info();
 		if number <= status.finalized_number && blockchain.hash(number)? == Some(hash) {
 			// This can happen after a forced change (triggered by the finality tracker when finality is stalled), since
 			// the voter will be restarted at the median last finalized block, which can be lower than the local best
@@ -812,7 +851,7 @@ pub(crate) fn finalize_block<B, Block: BlockT<Hash=H256>, E, RA>(
 				// finalization to remote nodes
 				if !justification_required {
 					if let Some(justification_period) = justification_period {
-						let last_finalized_number = client.info()?.chain.finalized_number;
+						let last_finalized_number = client.info().chain.finalized_number;
 						justification_required =
 							(!last_finalized_number.is_zero() || number - last_finalized_number == justification_period) &&
 							(last_finalized_number / justification_period != number / justification_period);
